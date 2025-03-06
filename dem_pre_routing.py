@@ -17,8 +17,7 @@ logging.basicConfig(
         '%(asctime)s (%(relativeCreated)d) %(levelname)s %(name)s '
         '[%(funcName)s:%(lineno)d] %(message)s'))
 LOGGER = logging.getLogger(__name__)
-
-MAX_PIXEL_FILL_COUNT = 10000  # TODO: dynamically set this in a way that makes sense
+logging.getLogger('ecoshard').setLevel(logging.INFO)
 
 
 def create_directory_hash(subwatershed_id):
@@ -45,7 +44,6 @@ def extract_dem_for_subwatershed(
         dem_path, gpkg_path, layer_name, geom_name,
         subwatershed_fid, output_raster_path):
     LOGGER.info(f'extracting dem for {subwatershed_fid}')
-
     cutline_sql = (
         f'SELECT ST_MakeValid({geom_name}) AS {geom_name} '
         f'FROM "{layer_name}" WHERE FID = {subwatershed_fid}'
@@ -78,25 +76,28 @@ def fill_with_richdem(
         dem_array = src.read(band_index)
         profile = src.profile
         no_data = profile.get('nodata')
+        transform = src.transform
+        crs = src.crs
 
+    original_dtype = profile['dtype']
     LOGGER.debug(f'creating rdarray from {dem_path}')
     rd_dem = rd.rdarray(dem_array, no_data=no_data)
-    # 'epsilon=True' can help route flow off of flats
     LOGGER.debug(f'filling depressionsfrom {dem_path}')
+    rd_dem.geotransform = transform
     rd_filled = rd.FillDepressions(rd_dem, epsilon=False)
-
-    LOGGER.debug(f'updating profile {dem_path}')
     profile.update(
-        dtype=rasterio.float32,
+        dtype=original_dtype,
         nodata=no_data,
         compress='lzw',
-        count=1
+        count=1,
+        transform=transform,
+        crs=crs,
     )
 
     LOGGER.debug(f'writing filled dem to {filled_dem_raster_path}')
     os.makedirs(working_dir, exist_ok=True)
     with rasterio.open(filled_dem_raster_path, 'w', **profile) as dst:
-        dst.write(rd_filled.astype(rasterio.float32), 1)
+        dst.write(rd_filled.astype(original_dtype), 1)
 
 
 def process_subwatershed(
@@ -116,6 +117,7 @@ def process_subwatershed(
         args=(
             global_dem_path, gpkg_path, layer_name, geom_name,
             subwatershed_fid, extracted_dem_path),
+        ignore_path_list=[gpkg_path],
         target_path_list=[extracted_dem_path],
         task_name=f'extract_dem_subwatershed_{subwatershed_fid}')
 
@@ -133,6 +135,10 @@ def process_subwatershed(
         dependent_task_list=[fill_pits_task],
         target_path_list=[flow_dir_path],
         task_name=f'flow_dir_subwatershed_{subwatershed_fid}')
+    task_graph.join()
+
+    routing.flow_accumulation_mfd(
+        (flow_dir_path, 1), 'test_flow_accum.tif')
 
     return flow_dir_path
 
@@ -172,8 +178,6 @@ def main():
             workspace_dir, hash_subdir, subwatershed_tag)
         os.makedirs(local_workspace_dir, exist_ok=True)
 
-        local_workspace_dir = os.path.join(
-            workspace_dir, subwatershed_tag)
         process_subwatershed(
             task_graph, global_dem_path, gpkg_path,
             layer_name, geom_name,
