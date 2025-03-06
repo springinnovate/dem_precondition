@@ -18,6 +18,7 @@ logging.basicConfig(
         '[%(funcName)s:%(lineno)d] %(message)s'))
 LOGGER = logging.getLogger(__name__)
 logging.getLogger('ecoshard').setLevel(logging.INFO)
+logging.getLogger('rasterio').setLevel(logging.INFO)
 
 
 def create_directory_hash(subwatershed_id):
@@ -150,7 +151,7 @@ def main():
     gpkg_path = './data/global_lev05.gpkg'
     workspace_dir = 'dem_pre_route_workspace'
     gpkg_basename = os.path.basename(os.path.splitext(gpkg_path)[0])
-    n_cpus = -1
+    n_cpus = psutil.cpu_count(logical=False)
     os.makedirs(workspace_dir, exist_ok=True)
     task_graph = taskgraph.TaskGraph(workspace_dir, n_cpus, 5.0)
 
@@ -163,7 +164,7 @@ def main():
 
     layer_name, geom_name = get_layer_and_geom_name(gpkg_path)
 
-    for subwatershed_fid in fid_list:
+    for index, subwatershed_fid in enumerate(fid_list):
         hash_subdir = create_directory_hash(subwatershed_fid)
         subwatershed_tag = f'{gpkg_basename}_{subwatershed_fid}'
         local_workspace_dir = os.path.join(
@@ -177,7 +178,8 @@ def main():
         rel_local_mfd_flow_path = os.path.relpath(
             local_mfd_flow_path, workspace_dir)
         index_dict['subwatershed_routing_index'][subwatershed_fid] = rel_local_mfd_flow_path
-        break  # TODO: just one for debugging
+        if index+2 == n_cpus:
+            break  # TODO: fill up the cpu
 
     task_graph.join()
     task_graph.close()
