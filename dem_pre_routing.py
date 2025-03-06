@@ -17,7 +17,6 @@ logging.basicConfig(
         '%(asctime)s (%(relativeCreated)d) %(levelname)s %(name)s '
         '[%(funcName)s:%(lineno)d] %(message)s'))
 LOGGER = logging.getLogger(__name__)
-INDEX_PATH = 'dem_pre_route_index.pkl'
 logging.getLogger('ecoshard').setLevel(logging.INFO)
 
 
@@ -49,7 +48,6 @@ def extract_dem_for_subwatershed(
         f'SELECT ST_MakeValid({geom_name}) AS {geom_name} '
         f'FROM "{layer_name}" WHERE FID = {subwatershed_fid}'
     )
-
     warp_options = gdal.WarpOptions(
         format='GTiff',
         dstNodata=-9999,
@@ -57,7 +55,6 @@ def extract_dem_for_subwatershed(
         cutlineDSName=gpkg_path,
         cutlineSQL=cutline_sql
     )
-
     gdal.Warp(
         output_raster_path,
         dem_path,
@@ -136,17 +133,7 @@ def process_subwatershed(
         dependent_task_list=[fill_pits_task],
         target_path_list=[flow_dir_path],
         task_name=f'flow_dir_subwatershed_{subwatershed_fid}')
-    task_graph.join()
-
-    routing.flow_accumulation_mfd(
-        (flow_dir_path, 1), 'test_flow_accum.tif')
-
     return flow_dir_path
-
-
-def build_index_entry(index_dict, subwatershed_fid, final_dem_path):
-    # Store the final path in the index using the FID as key.
-    index_dict[subwatershed_fid] = final_dem_path
 
 
 def get_fid_list(gpkg_path):
@@ -190,14 +177,13 @@ def main():
         rel_local_mfd_flow_path = os.path.relpath(
             local_mfd_flow_path, workspace_dir)
         index_dict['subwatershed_routing_index'][subwatershed_fid] = rel_local_mfd_flow_path
-
         break  # TODO: just one for debugging
 
     task_graph.join()
     task_graph.close()
 
-    INDEX_PATH = os.path.join(workspace_dir, 'index.pkl')
-    with open(INDEX_PATH, 'wb') as f:
+    index_path = os.path.join(workspace_dir, 'index.pkl')
+    with open(index_path, 'wb') as f:
         pickle.dump(index_dict, f)
 
 
