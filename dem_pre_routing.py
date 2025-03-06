@@ -1,8 +1,8 @@
+import pickle
 import logging
 import sys
 import os
 import hashlib
-import pathlib
 
 from osgeo import gdal, ogr
 from ecoshard.geoprocessing import routing
@@ -17,6 +17,7 @@ logging.basicConfig(
         '%(asctime)s (%(relativeCreated)d) %(levelname)s %(name)s '
         '[%(funcName)s:%(lineno)d] %(message)s'))
 LOGGER = logging.getLogger(__name__)
+INDEX_PATH = 'dem_pre_route_index.pkl'
 logging.getLogger('ecoshard').setLevel(logging.INFO)
 
 
@@ -167,7 +168,11 @@ def main():
     task_graph = taskgraph.TaskGraph(workspace_dir, n_cpus, 5.0)
 
     fid_list = get_fid_list(gpkg_path)
-    index_dict = {}
+    index_dict = {
+        'source_dem': global_dem_path,
+        'source_subwatershed': gpkg_path,
+        'subwatershed_routing_index': {}
+    }
 
     layer_name, geom_name = get_layer_and_geom_name(gpkg_path)
 
@@ -178,14 +183,22 @@ def main():
             workspace_dir, hash_subdir, subwatershed_tag)
         os.makedirs(local_workspace_dir, exist_ok=True)
 
-        process_subwatershed(
+        local_mfd_flow_path = process_subwatershed(
             task_graph, global_dem_path, gpkg_path,
             layer_name, geom_name,
             subwatershed_fid, local_workspace_dir)
+        rel_local_mfd_flow_path = os.path.relpath(
+            local_mfd_flow_path, workspace_dir)
+        index_dict['subwatershed_routing_index'][subwatershed_fid] = rel_local_mfd_flow_path
+
         break  # TODO: just one for debugging
 
     task_graph.join()
     task_graph.close()
+
+    INDEX_PATH = os.path.join(workspace_dir, 'index.pkl')
+    with open(INDEX_PATH, 'wb') as f:
+        pickle.dump(index_dict, f)
 
 
 if __name__ == '__main__':
