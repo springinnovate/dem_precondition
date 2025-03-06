@@ -5,7 +5,7 @@ import hashlib
 import pathlib
 
 from osgeo import gdal, ogr
-import ecoshard.routing
+from ecoshard.geoprocessing import routing
 import taskgraph
 
 logging.basicConfig(
@@ -16,6 +16,8 @@ logging.basicConfig(
         '[%(funcName)s:%(lineno)d] %(message)s'))
 LOGGER = logging.getLogger(__name__)
 
+MAX_PIXEL_FILL_COUNT = 10000  # TODO: dynamically set this in a way that makes sense
+
 
 def create_directory_hash(subwatershed_id):
     hash_str = hashlib.sha256(str(subwatershed_id).encode('utf-8')).hexdigest()
@@ -25,10 +27,10 @@ def create_directory_hash(subwatershed_id):
 def extract_dem_for_subwatershed(dem_path, gpkg_path, subwatershed_fid, output_raster_path):
     # Example placeholder function for extracting DEM by subwatershed geometry.
     # 1) Open GPKG, get geometry of subwatershed FID
-    vector = ogr.Open(gpkg_path)
-    layer = vector.GetLayer()
-    subwatershed_feature = layer.GetFeature(subwatershed_fid)
-    geom = subwatershed_feature.GetGeometryRef()
+    #vector = ogr.Open(gpkg_path)
+    #layer = vector.GetLayer()
+    #subwatershed_feature = layer.GetFeature(subwatershed_fid)
+    #geom = subwatershed_feature.GetGeometryRef()
 
     # 2) Create in-memory mask or use gdal.Warp to clip
     # This is a very rough example for illustration.
@@ -48,70 +50,86 @@ def extract_dem_for_subwatershed(dem_path, gpkg_path, subwatershed_fid, output_r
     # This snippet just returns the path where the DEM is stored.
     return output_raster_path
 
-def fill_and_route_dem(dem_path, filled_dem_path):
-    # Using the ecoshard.routing library to fill pits/hydrological routing.
-    # Adjust to your actual function calls.
-    ecoshard.routing.fill_pits(dem_path, filled_dem_path)
-    # Additional routing steps can be placed here if needed.
-    return filled_dem_path
+
+def process_subwatershed(task_graph, global_dem_path, gpkg_path, subwatershed_fid, workspace_dir):
+    # Adjust file paths as needed
+
+    extracted_dem_path = os.path.join(
+        workspace_dir, f'extracted_dem_{subwatershed_fid}.tif')
+    filled_dem_raster_path = os.path.join(
+        workspace_dir, f'filled_dem_{subwatershed_fid}.tif')
+    flow_dir_path = os.path.join(
+        workspace_dir, f'flow_dir_mfd_{subwatershed_fid}.tif')
+
+    extract_dem_task = task_graph.add_task(
+        func=extract_dem_for_subwatershed,
+        args=(global_dem_path, gpkg_path, subwatershed_fid, extracted_dem_path),
+        target_path_list=[extracted_dem_path],
+        task_name=f'extract_dem_subwatershed_{subwatershed_fid}')
+
+    fill_pits_task = task_graph.add_task(
+        func=routing.fill_pits,
+        args=((extracted_dem_path, 1), filled_dem_raster_path),
+        kwargs={
+            'working_dir': workspace_dir,
+            'max_pixel_fill_count': MAX_PIXEL_FILL_COUNT
+        },
+        dependent_task_list=[extract_dem_task],
+        target_path_list=[filled_dem_raster_path],
+        task_name=f'fill_pits_subwatershed_{subwatershed_fid}')
+
+    _ = task_graph.add_task(
+        func=routing.flow_dir_mfd,
+        args=((filled_dem_raster_path, 1), flow_dir_path),
+        kwargs={'working_dir': workspace_dir},
+        dependent_task_list=[fill_pits_task],
+        target_path_list=[flow_dir_path],
+        task_name=f'flow_dir_subwatershed_{subwatershed_fid}')
+
+    return flow_dir_path
+
 
 def build_index_entry(index_dict, subwatershed_fid, final_dem_path):
     # Store the final path in the index using the FID as key.
     index_dict[subwatershed_fid] = final_dem_path
 
-def main():
-    # Configure some placeholders
-    dem_path = '/path/to/large_dem.tif'
-    gpkg_path = '/path/to/subwatersheds.gpkg'
-    workspace_dir = '/path/to/workspace'
-    n_cpus = -1  # use all CPUs, or set an integer
 
-    os.makedirs(workspace_dir, exist_ok=True)
-    task_graph_obj = taskgraph.TaskGraph(workspace_dir, n_cpus, 5.0)
-
-    # Open the GPKG to iterate subwatersheds
+def get_fid_list(gpkg_path):
     vector = ogr.Open(gpkg_path)
     layer = vector.GetLayer()
+    fid_list = [feature.GetFID() for feature in layer]
+    layer = None
+    vector = None
+    return fid_list
+
+
+def main():
+    global_dem_path = './data/astgtm_compressed.tif'
+    gpkg_path = './data/global_lev05.gpkg'
+    workspace_dir = 'dem_pre_route_workspace'
+    gpkg_basename = os.path.basename(os.path.splitext(gpkg_path)[0])
+    n_cpus = -1
+    os.makedirs(workspace_dir, exist_ok=True)
+    task_graph = taskgraph.TaskGraph(workspace_dir, n_cpus, 5.0)
+
+    fid_list = get_fid_list(gpkg_path)
     index_dict = {}
 
-    for feature in layer:
-        subwatershed_fid = feature.GetFID()
+    for subwatershed_fid in fid_list:
         hash_subdir = create_directory_hash(subwatershed_fid)
-        out_dir = os.path.join(workspace_dir, hash_subdir, str(subwatershed_fid))
-        pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+        subwatershed_tag = f'{gpkg_basename}_{subwatershed_fid}'
+        local_workspace_dir = os.path.join(
+            workspace_dir, hash_subdir, subwatershed_tag)
+        os.makedirs(local_workspace_dir, exist_ok=True)
 
-        extracted_dem_path = os.path.join(out_dir, 'extracted_dem.tif')
-        filled_dem_path = os.path.join(out_dir, 'filled_dem.tif')
+        process_subwatershed(
+            task_graph, global_dem_path, gpkg_path,
+            subwatershed_fid, workspace_dir)
+        break  # TODO: just one for debugging
 
-        task_extract = task_graph_obj.add_task(
-            func=extract_dem_for_subwatershed,
-            args=(dem_path, gpkg_path, subwatershed_fid, extracted_dem_path),
-            target_path_list=[extracted_dem_path],
-            task_name=f'extract_dem_for_{subwatershed_fid}')
+    task_graph.join()
+    task_graph.close()
 
-        task_fill = task_graph_obj.add_task(
-            func=fill_and_route_dem,
-            args=(extracted_dem_path, filled_dem_path),
-            dependent_task_list=[task_extract],
-            target_path_list=[filled_dem_path],
-            task_name=f'fill_and_route_{subwatershed_fid}')
-
-        def _build_index_wrapper(fid, path, index=index_dict):
-            build_index_entry(index, fid, path)
-
-        task_graph_obj.add_task(
-            func=_build_index_wrapper,
-            args=(subwatershed_fid, filled_dem_path),
-            dependent_task_list=[task_fill],
-            task_name=f'build_index_{subwatershed_fid}')
-
-    task_graph_obj.join()
-    task_graph_obj.close()
-
-    # Here is where you'd persist the index to disk if needed
-    # for example:
-    # with open(os.path.join(workspace_dir, 'index.json'), 'w') as index_file:
-    #     json.dump(index_dict, index_file)
 
 if __name__ == '__main__':
     main()
