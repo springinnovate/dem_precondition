@@ -1,12 +1,13 @@
-import pickle
-import logging
-import sys
-import os
 import hashlib
+import logging
+import os
+import pickle
+import sys
 
-from osgeo import gdal, ogr
-from ecoshard.geoprocessing import routing
 from ecoshard import taskgraph
+from ecoshard.geoprocessing import routing
+from osgeo import gdal, ogr
+import psutil
 import rasterio
 import richdem as rd
 
@@ -178,8 +179,6 @@ def main():
         rel_local_mfd_flow_path = os.path.relpath(
             local_mfd_flow_path, workspace_dir)
         index_dict['subwatershed_routing_index'][subwatershed_fid] = rel_local_mfd_flow_path
-        if index+2 == n_cpus:
-            break  # TODO: fill up the cpu
 
     task_graph.join()
     task_graph.close()
@@ -187,6 +186,11 @@ def main():
     index_path = os.path.join(workspace_dir, 'index.pkl')
     with open(index_path, 'wb') as f:
         pickle.dump(index_dict, f)
+
+    with open(index_path, 'rb') as f:
+        new_index = pickle.loads(f.read())
+    LOGGER.info(
+        f'all done, processed {len(new_index["subwatershed_routing_index"])} dems')
 
 
 if __name__ == '__main__':
