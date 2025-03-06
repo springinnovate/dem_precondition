@@ -6,7 +6,9 @@ import pathlib
 
 from osgeo import gdal, ogr
 from ecoshard.geoprocessing import routing
-import taskgraph
+from ecoshard import taskgraph
+import rasterio
+import richdem as rd
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -24,34 +26,82 @@ def create_directory_hash(subwatershed_id):
     return os.path.join(hash_str[:2], hash_str[2:4])
 
 
-def extract_dem_for_subwatershed(dem_path, gpkg_path, subwatershed_fid, output_raster_path):
-    # Example placeholder function for extracting DEM by subwatershed geometry.
-    # 1) Open GPKG, get geometry of subwatershed FID
-    #vector = ogr.Open(gpkg_path)
-    #layer = vector.GetLayer()
-    #subwatershed_feature = layer.GetFeature(subwatershed_fid)
-    #geom = subwatershed_feature.GetGeometryRef()
+def get_layer_and_geom_name(gpkg_path):
+    vector_ds = ogr.Open(gpkg_path)
+    layer = vector_ds.GetLayer()  # since there's only one layer
+    layer_name = layer.GetName()
 
-    # 2) Create in-memory mask or use gdal.Warp to clip
-    # This is a very rough example for illustration.
-    # Replace 'layerName' with your actual layer name or an appropriate SQL where clause.
+    # Attempt to detect geometry column name from the layer definition
+    layer_defn = layer.GetLayerDefn()
+    geom_field_defn = layer_defn.GetGeomFieldDefn(0)
+    geometry_column_name = geom_field_defn.GetName()
+    if not geometry_column_name:
+        # Fall back if geometry column name is empty
+        geometry_column_name = 'geom'
+    return layer_name, geometry_column_name
+
+
+def extract_dem_for_subwatershed(
+        dem_path, gpkg_path, layer_name, geom_name,
+        subwatershed_fid, output_raster_path):
+    LOGGER.info(f'extracting dem for {subwatershed_fid}')
+
+    cutline_sql = (
+        f'SELECT ST_MakeValid({geom_name}) AS {geom_name} '
+        f'FROM "{layer_name}" WHERE FID = {subwatershed_fid}'
+    )
+
     warp_options = gdal.WarpOptions(
         format='GTiff',
-        cutlineDSName=gpkg_path,
-        cutlineWhere=f'FID = {subwatershed_fid}',
         dstNodata=-9999,
-        cropToCutline=True)
+        cropToCutline=True,
+        cutlineDSName=gpkg_path,
+        cutlineSQL=cutline_sql
+    )
+
     gdal.Warp(
         output_raster_path,
         dem_path,
-        options=warp_options)
-
-    # 3) If you need a local projection, apply a projection transform here.
-    # This snippet just returns the path where the DEM is stored.
-    return output_raster_path
+        options=warp_options
+    )
+    LOGGER.info(f'done extracting dem for {subwatershed_fid}')
 
 
-def process_subwatershed(task_graph, global_dem_path, gpkg_path, subwatershed_fid, workspace_dir):
+def fill_with_richdem(
+        dem_path_band_tuple, filled_dem_raster_path,
+        working_dir):
+    dem_path, band_index = dem_path_band_tuple
+
+    # Read the input DEM as a NumPy array using rasterio
+    LOGGER.debug(f'loading {dem_path} with rasterio')
+    with rasterio.open(dem_path) as src:
+        dem_array = src.read(band_index)
+        profile = src.profile
+        no_data = profile.get('nodata')
+
+    LOGGER.debug(f'creating rdarray from {dem_path}')
+    rd_dem = rd.rdarray(dem_array, no_data=no_data)
+    # 'epsilon=True' can help route flow off of flats
+    LOGGER.debug(f'filling depressionsfrom {dem_path}')
+    rd_filled = rd.FillDepressions(rd_dem, epsilon=False)
+
+    LOGGER.debug(f'updating profile {dem_path}')
+    profile.update(
+        dtype=rasterio.float32,
+        nodata=no_data,
+        compress='lzw',
+        count=1
+    )
+
+    LOGGER.debug(f'writing filled dem to {filled_dem_raster_path}')
+    os.makedirs(working_dir, exist_ok=True)
+    with rasterio.open(filled_dem_raster_path, 'w', **profile) as dst:
+        dst.write(rd_filled.astype(rasterio.float32), 1)
+
+
+def process_subwatershed(
+        task_graph, global_dem_path, gpkg_path,
+        layer_name, geom_name, subwatershed_fid, workspace_dir):
     # Adjust file paths as needed
 
     extracted_dem_path = os.path.join(
@@ -63,17 +113,15 @@ def process_subwatershed(task_graph, global_dem_path, gpkg_path, subwatershed_fi
 
     extract_dem_task = task_graph.add_task(
         func=extract_dem_for_subwatershed,
-        args=(global_dem_path, gpkg_path, subwatershed_fid, extracted_dem_path),
+        args=(
+            global_dem_path, gpkg_path, layer_name, geom_name,
+            subwatershed_fid, extracted_dem_path),
         target_path_list=[extracted_dem_path],
         task_name=f'extract_dem_subwatershed_{subwatershed_fid}')
 
     fill_pits_task = task_graph.add_task(
-        func=routing.fill_pits,
-        args=((extracted_dem_path, 1), filled_dem_raster_path),
-        kwargs={
-            'working_dir': workspace_dir,
-            'max_pixel_fill_count': MAX_PIXEL_FILL_COUNT
-        },
+        func=fill_with_richdem,
+        args=((extracted_dem_path, 1), filled_dem_raster_path, workspace_dir),
         dependent_task_list=[extract_dem_task],
         target_path_list=[filled_dem_raster_path],
         task_name=f'fill_pits_subwatershed_{subwatershed_fid}')
@@ -115,6 +163,8 @@ def main():
     fid_list = get_fid_list(gpkg_path)
     index_dict = {}
 
+    layer_name, geom_name = get_layer_and_geom_name(gpkg_path)
+
     for subwatershed_fid in fid_list:
         hash_subdir = create_directory_hash(subwatershed_fid)
         subwatershed_tag = f'{gpkg_basename}_{subwatershed_fid}'
@@ -122,9 +172,12 @@ def main():
             workspace_dir, hash_subdir, subwatershed_tag)
         os.makedirs(local_workspace_dir, exist_ok=True)
 
+        local_workspace_dir = os.path.join(
+            workspace_dir, subwatershed_tag)
         process_subwatershed(
             task_graph, global_dem_path, gpkg_path,
-            subwatershed_fid, workspace_dir)
+            layer_name, geom_name,
+            subwatershed_fid, local_workspace_dir)
         break  # TODO: just one for debugging
 
     task_graph.join()
