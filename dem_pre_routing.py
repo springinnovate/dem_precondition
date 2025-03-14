@@ -66,13 +66,35 @@ def extract_dem_for_subwatershed(
 
 
 def fill_with_richdem(
-        dem_path_band_tuple, filled_dem_raster_path,
-        working_dir):
-    dem_path, band_index = dem_path_band_tuple
+        global_dem_path_band_tuple, global_vector_path, layer_name, geom_name,
+        subwatershed_fid, filled_dem_raster_path):
+    global_dem_path, band_index = global_dem_path_band_tuple
+    dem_basename = os.path.basename(os.path.splitext(global_dem_path)[0])
+    LOGGER.info(f'extracting dem for {subwatershed_fid}')
+    cutline_sql = (
+        f'SELECT ST_MakeValid({geom_name}) AS {geom_name} '
+        f'FROM "{layer_name}" WHERE FID = {subwatershed_fid}'
+    )
+    warp_options = gdal.WarpOptions(
+        format='GTiff',
+        dstNodata=-9999,
+        cropToCutline=True,
+        cutlineDSName=global_vector_path,
+        cutlineSQL=cutline_sql
+    )
+    intermediate_cut_dem_path = os.path.join(os.path.dirname(
+        filled_dem_raster_path),
+        f'{dem_basename}_cut_to_{subwatershed_fid}.tif')
+    gdal.Warp(
+        global_dem_path,
+        intermediate_cut_dem_path,
+        options=warp_options
+    )
+    LOGGER.info(f'done extracting dem for {subwatershed_fid}')
 
     # Read the input DEM as a NumPy array using rasterio
-    LOGGER.debug(f'loading {dem_path} with rasterio')
-    with rasterio.open(dem_path) as src:
+    LOGGER.info(f'loading {intermediate_cut_dem_path} with rasterio')
+    with rasterio.open(intermediate_cut_dem_path) as src:
         dem_array = src.read(band_index)
         profile = src.profile
         no_data = profile.get('nodata')
@@ -80,9 +102,9 @@ def fill_with_richdem(
         crs = src.crs
 
     original_dtype = profile['dtype']
-    LOGGER.debug(f'creating rdarray from {dem_path}')
+    LOGGER.debug(f'creating rdarray from {intermediate_cut_dem_path}')
     rd_dem = rd.rdarray(dem_array, no_data=no_data)
-    LOGGER.debug(f'filling depressionsfrom {dem_path}')
+    LOGGER.debug(f'filling depressionsfrom {intermediate_cut_dem_path}')
     rd_dem.geotransform = transform
     rd_filled = rd.FillDepressions(rd_dem, epsilon=False)
     profile.update(
@@ -93,11 +115,15 @@ def fill_with_richdem(
         transform=transform,
         crs=crs,
     )
-
     LOGGER.debug(f'writing filled dem to {filled_dem_raster_path}')
-    os.makedirs(working_dir, exist_ok=True)
     with rasterio.open(filled_dem_raster_path, 'w', **profile) as dst:
         dst.write(rd_filled.astype(original_dtype), 1)
+
+    try:
+        LOGGER.info(f'cleaning up intermeidate {intermediate_cut_dem_path}')
+        os.remove(intermediate_cut_dem_path)
+    except Exception:
+        LOGGER.warning(f'could not delete {intermediate_cut_dem_path}')
 
 
 def process_subwatershed(
@@ -105,26 +131,14 @@ def process_subwatershed(
         layer_name, geom_name, subwatershed_fid, workspace_dir):
     # Adjust file paths as needed
 
-    extracted_dem_path = os.path.join(
-        workspace_dir, f'extracted_dem_{subwatershed_fid}.tif')
     filled_dem_raster_path = os.path.join(
         workspace_dir, f'filled_dem_{subwatershed_fid}.tif')
     flow_dir_path = os.path.join(
         workspace_dir, f'flow_dir_mfd_{subwatershed_fid}.tif')
 
-    extract_dem_task = task_graph.add_task(
-        func=extract_dem_for_subwatershed,
-        args=(
-            global_dem_path, gpkg_path, layer_name, geom_name,
-            subwatershed_fid, extracted_dem_path),
-        ignore_path_list=[gpkg_path],
-        target_path_list=[extracted_dem_path],
-        task_name=f'extract_dem_subwatershed_{subwatershed_fid}')
-
     fill_pits_task = task_graph.add_task(
         func=fill_with_richdem,
-        args=((extracted_dem_path, 1), filled_dem_raster_path, workspace_dir),
-        dependent_task_list=[extract_dem_task],
+        args=((global_dem_path, 1), filled_dem_raster_path, workspace_dir),
         target_path_list=[filled_dem_raster_path],
         task_name=f'fill_pits_subwatershed_{subwatershed_fid}')
 
